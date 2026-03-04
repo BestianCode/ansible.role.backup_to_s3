@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PATH="{{ aws_s3_backup_exec_path }}"
+export AWS_PAGER=""
+
+umask {{ aws_s3_backup_umask }}
+
+JOB_NAME="{{ aws_s3_backup_job_name }}"
+LOG_FILE="{{ aws_s3_backup_log_file }}"
+mkdir -p "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE"
+chmod 0640 "$LOG_FILE"
+exec >>"$LOG_FILE"
+exec 2>&1
+
+echo "[$(date -Iseconds)] Starting $JOB_NAME"
+
+AWS_CLI_BIN="{{ aws_s3_backup_aws_cli_binary }}"
+if [ ! -x "$AWS_CLI_BIN" ]; then
+  AWS_CLI_BIN="$(command -v aws || true)"
+fi
+if [ -z "$AWS_CLI_BIN" ]; then
+  echo "ERROR: aws cli binary not found" >&2
+  exit 10
+fi
+
+export AWS_ACCESS_KEY_ID="{{ aws_s3_backup_access_key }}"
+export AWS_SECRET_ACCESS_KEY="{{ aws_s3_backup_secret_key }}"
+export AWS_DEFAULT_REGION="{{ aws_s3_backup_region }}"
+export AWS_REGION="{{ aws_s3_backup_region }}"
+unset AWS_SHARED_CREDENTIALS_FILE AWS_PROFILE AWS_CONFIG_FILE
+
+BACKUP_ROOT="{{ aws_s3_backup_local_folder }}"
+FILES_SUBDIR="files"
+TIMESTAMP="$(date +"%Y.%m.%d-%H.%M")"
+CURRENT_DIR="$BACKUP_ROOT/$TIMESTAMP"
+FILES_DIR="$CURRENT_DIR/$FILES_SUBDIR"
+mkdir -p "$FILES_DIR"
+chmod 0700 "$CURRENT_DIR"
+
+S3_URI="s3://{{ aws_s3_backup_bucket }}/{{ aws_s3_backup_bucket_folder }}/$TIMESTAMP"
+RETENTION={{ aws_s3_backup_local_retention | int }}
+START_SERVICES={{ aws_s3_backup_start_services | ternary('1', '0') }}
+REBOOT_AFTER={{ aws_s3_backup_reboot_after | ternary('1', '0') }}
+PRE_STOP_STRICT={{ aws_s3_backup_pre_stop_strict | ternary('1', '0') }}
+FAIL_IF_MISSING={{ aws_s3_backup_fail_if_missing | ternary('1', '0') }}
+MANIFEST_ENABLED={{ aws_s3_backup_manifest_enabled | ternary('1', '0') }}
+USE_PIGZ={{ aws_s3_backup_use_pigz | ternary('1', '0') }}
+ARCHIVE_EXT="{{ aws_s3_backup_archive_format }}"
+
+BACKUP_PATHS=(
+{% for path in aws_s3_backup_folders %}
+"{{ path }}"
+{% endfor %}
+)
+STOP_SERVICE_LIST=(
+{% for svc in aws_s3_backup_stop_services %}
+"{{ svc }}"
+{% endfor %}
+)
+PRE_STOP_COMMANDS=(
+{% for cmd in aws_s3_backup_pre_stop_commands %}
+"{{ cmd | replace('"', '\\"') }}"
+{% endfor %}
+)
+POST_START_COMMANDS=(
+{% for cmd in aws_s3_backup_post_start_commands %}
+"{{ cmd | replace('"', '\\"') }}"
+{% endfor %}
+)
+TAR_EXTRA_OPTS=(
+{% for opt in aws_s3_backup_extra_tar_options %}
+"{{ opt }}"
+{% endfor %}
+)
+
+declare -a STOPPED_SERVICES=()
+declare -a MANIFEST_SOURCES=()
+declare -a MANIFEST_ARCHIVES=()
+cleanup() {
+  local exit_code=$?
+{% raw %}
+  if [ "$START_SERVICES" -eq 1 ] && [ "${#STOPPED_SERVICES[@]}" -gt 0 ]; then
+{% endraw %}
+    for svc in "${STOPPED_SERVICES[@]}"; do
+      if systemctl list-unit-files "$svc" >/dev/null 2>&1; then
+        systemctl start "$svc" || echo "WARN: Unable to start $svc" >&2
+      fi
+    done
+  fi
+
+{% raw %}
+  if [ ${#POST_START_COMMANDS[@]} -gt 0 ]; then
+{% endraw %}
+    for cmd in "${POST_START_COMMANDS[@]}"; do
+      echo "Running post-start command: $cmd"
+      bash -c "$cmd"
+    done
+  fi
+
+  if [ "$exit_code" -eq 0 ]; then
+    ln -sfn "$CURRENT_DIR" "$BACKUP_ROOT/latest"
+    if [ "$REBOOT_AFTER" -eq 1 ]; then
+      echo "Scheduling reboot after successful $JOB_NAME"
+      /sbin/shutdown -r +1 "$JOB_NAME completed"
+    fi
+  else
+    echo "[$(date -Iseconds)] Backup failed with exit code $exit_code" >&2
+  fi
+}
+trap cleanup EXIT
+
+run_pre_stop_commands() {
+{% raw %}
+  if [ ${#PRE_STOP_COMMANDS[@]} -eq 0 ]; then
+{% endraw %}
+    return
+  fi
+
+  for cmd in "${PRE_STOP_COMMANDS[@]}"; do
+    echo "Running pre-stop command: $cmd"
+    if ! bash -c "$cmd"; then
+      rc=$?
+      if [ "$PRE_STOP_STRICT" -eq 1 ]; then
+        echo "ERROR: Pre-stop command '$cmd' failed with exit code $rc" >&2
+        exit 30
+      else
+        echo "WARN: Pre-stop command '$cmd' failed with exit code $rc but continuing" >&2
+      fi
+    fi
+  done
+}
+
+stop_services() {
+{% raw %}
+  if [ "${#STOP_SERVICE_LIST[@]}" -eq 0 ]; then
+{% endraw %}
+    return
+  fi
+
+  for svc in "${STOP_SERVICE_LIST[@]}"; do
+    if systemctl list-unit-files "$svc" >/dev/null 2>&1; then
+      if systemctl is-active --quiet "$svc"; then
+        echo "Stopping service $svc"
+        systemctl stop "$svc"
+        STOPPED_SERVICES+=("$svc")
+      else
+        echo "Service $svc already stopped"
+      fi
+    else
+      echo "WARN: Service $svc not found"
+    fi
+  done
+}
+
+run_pre_stop_commands
+stop_services
+
+TAR_BASE_CMD=(tar)
+TAR_MODE="-czf"
+if [ "$USE_PIGZ" -eq 1 ] && command -v pigz >/dev/null 2>&1; then
+  TAR_BASE_CMD+=("--use-compress-program" "pigz")
+  TAR_MODE="-cf"
+fi
+
+{% raw %}
+if [ "${#TAR_EXTRA_OPTS[@]}" -gt 0 ]; then
+{% endraw %}
+  TAR_BASE_CMD+=("${TAR_EXTRA_OPTS[@]}")
+fi
+
+{% raw %}
+for pattern in "${BACKUP_PATHS[@]}"; do
+  resolved_paths=()
+  if [[ "$pattern" == *"*"* || "$pattern" == *"?"* || "$pattern" == *"["* ]]; then
+    mapfile -t resolved_paths < <(compgen -G "$pattern" || true)
+    if [ "${#resolved_paths[@]}" -eq 0 ]; then
+      msg="Pattern $pattern matched no files"
+      if [ "$FAIL_IF_MISSING" -eq 1 ]; then
+        echo "ERROR: $msg" >&2
+        exit 20
+      else
+        echo "WARN: $msg - skipping"
+        continue
+      fi
+    fi
+  else
+    resolved_paths=("$pattern")
+  fi
+
+  for src in "${resolved_paths[@]}"; do
+    if [ ! -e "$src" ]; then
+      msg="Source $src not found"
+      if [ "$FAIL_IF_MISSING" -eq 1 ]; then
+        echo "ERROR: $msg" >&2
+        exit 20
+      else
+        echo "WARN: $msg - skipping"
+        continue
+      fi
+    fi
+
+    safe_name=$(echo "$src" | sed 's#/#_#g' | sed 's/^_//')
+    safe_target="$FILES_DIR/${safe_name}"
+
+    if [ -f "$src" ]; then
+      ext="${src##*.}"
+      ext_lower=$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')
+      case "$ext_lower" in
+        gz|bz|bz2|zip|7z)
+          echo "Copying pre-compressed file $src to $safe_target"
+          cp -a "$src" "$safe_target"
+          MANIFEST_SOURCES+=("$src")
+          MANIFEST_ARCHIVES+=("$(basename "$safe_target")")
+          continue
+          ;;
+      esac
+    fi
+
+    archive_path="${safe_target}.${ARCHIVE_EXT}"
+    echo "Archiving $src to $archive_path"
+    src_dir=$(dirname "$src")
+    src_item=$(basename "$src")
+    tar_cmd=("${TAR_BASE_CMD[@]}" "$TAR_MODE" "$archive_path" -C "$src_dir" "$src_item")
+    "${tar_cmd[@]}"
+    MANIFEST_SOURCES+=("$src")
+    MANIFEST_ARCHIVES+=("$(basename "$archive_path")")
+  done
+done
+{% endraw %}
+
+if [ "$MANIFEST_ENABLED" -eq 1 ]; then
+  manifest_file="$CURRENT_DIR/manifest.json"
+  host_name=$(hostname -f 2>/dev/null || hostname)
+  {
+    echo '{'
+    echo "  \"host\": \"$host_name\",";
+    echo "  \"timestamp\": \"$TIMESTAMP\",";
+    echo "  \"bucket\": \"{{ aws_s3_backup_bucket }}\",";
+    echo "  \"bucket_folder\": \"{{ aws_s3_backup_bucket_folder }}\",";
+    echo '  "artifacts":['
+    for i in "${!MANIFEST_SOURCES[@]}"; do
+      src="${MANIFEST_SOURCES[$i]}"
+      art="${MANIFEST_ARCHIVES[$i]}"
+      printf '    {"source":"%s","archive":"%s"}' "$src" "$art"
+{% raw %}
+  if [ "$i" -lt $(( ${#MANIFEST_SOURCES[@]} - 1 )) ]; then
+{% endraw %}
+        printf ','
+      fi
+      printf '\n'
+    done
+    echo '  ]'
+    echo '}'
+  } >"$manifest_file"
+fi
+
+printf "Uploading %s to %s\n" "$CURRENT_DIR" "$S3_URI"
+AWS_CMD=("$AWS_CLI_BIN" s3 sync "$CURRENT_DIR" "$S3_URI" --only-show-errors --region "$AWS_DEFAULT_REGION")
+"${AWS_CMD[@]}"
+
+echo "S3 upload complete"
+
+if [ "$RETENTION" -gt 0 ]; then
+  mapfile -t existing_dirs < <(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+{% raw %}
+  total="${#existing_dirs[@]}"
+{% endraw %}
+  if [ "$total" -gt "$RETENTION" ]; then
+    remove_count=$(( total - RETENTION ))
+    for ((i=0; i<remove_count; i++)); do
+      old_dir="$BACKUP_ROOT/${existing_dirs[$i]}"
+      if [ "$old_dir" != "$CURRENT_DIR" ]; then
+        echo "Removing old backup $old_dir"
+        rm -rf "$old_dir"
+      fi
+    done
+  fi
+fi
+
+echo "[$(date -Iseconds)] $JOB_NAME finished"

@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PATH="{{ aws_s3_backup_exec_path }}"
+export AWS_PAGER=""
+
+umask {{ aws_s3_backup_umask }}
+
+JOB_NAME="{{ aws_s3_backup_job_name }} restore"
+AWS_CLI_BIN="{{ aws_s3_backup_aws_cli_binary }}"
+if [ ! -x "$AWS_CLI_BIN" ]; then
+  AWS_CLI_BIN="$(command -v aws || true)"
+fi
+if [ -z "$AWS_CLI_BIN" ]; then
+  echo "ERROR: aws cli binary not found" >&2
+  exit 10
+fi
+
+export AWS_ACCESS_KEY_ID="{{ aws_s3_backup_access_key }}"
+export AWS_SECRET_ACCESS_KEY="{{ aws_s3_backup_secret_key }}"
+export AWS_DEFAULT_REGION="{{ aws_s3_backup_region }}"
+export AWS_REGION="{{ aws_s3_backup_region }}"
+unset AWS_SHARED_CREDENTIALS_FILE AWS_PROFILE AWS_CONFIG_FILE
+
+S3_PREFIX="s3://{{ aws_s3_backup_bucket }}/{{ aws_s3_backup_bucket_folder }}/"
+RESTORE_ROOT="{{ aws_s3_backup_restore_folder }}"
+mkdir -p "$RESTORE_ROOT"
+chmod 0700 "$RESTORE_ROOT"
+
+declare -a BACKUP_NAMES=()
+
+load_backups() {
+  mapfile -t BACKUP_NAMES < <("$AWS_CLI_BIN" s3 ls "$S3_PREFIX" | awk '{print $2}' | sed 's#/$##' | sed '/^$/d')
+}
+
+print_backups() {
+{% raw %}
+  if [ "${#BACKUP_NAMES[@]}" -eq 0 ]; then
+{% endraw %}
+    echo "No backups found under $S3_PREFIX" >&2
+    exit 1
+  fi
+
+  echo "Available backups under $S3_PREFIX"
+  for idx in "${!BACKUP_NAMES[@]}"; do
+    printf "%3d) %s\n" $(( idx + 1 )) "${BACKUP_NAMES[$idx]}"
+  done
+}
+
+load_backups
+
+if [ "$#" -eq 0 ]; then
+  print_backups
+  exit 0
+fi
+
+if [ "$#" -ne 1 ]; then
+  echo "Usage: $(basename "$0") [backup-number]" >&2
+  exit 2
+fi
+
+selection="$1"
+if ! [[ "$selection" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: Backup selection must be a positive integer" >&2
+  exit 3
+fi
+
+index=$(( selection - 1 ))
+{% raw %}
+if [ "$index" -lt 0 ] || [ "$index" -ge "${#BACKUP_NAMES[@]}" ]; then
+{% endraw %}
+  echo "ERROR: Backup number $selection is out of range" >&2
+  print_backups
+  exit 4
+fi
+
+chosen="${BACKUP_NAMES[$index]}"
+source_uri="$S3_PREFIX$chosen/"
+destination="$RESTORE_ROOT/$chosen"
+
+if [ -d "$destination" ]; then
+  echo "Cleaning existing restore directory $destination"
+  rm -rf "$destination"
+fi
+mkdir -p "$destination"
+
+printf "Downloading %s to %s\n" "$source_uri" "$destination"
+"$AWS_CLI_BIN" s3 sync "$source_uri" "$destination" --only-show-errors --region "$AWS_DEFAULT_REGION"
+
+echo "Backup $chosen downloaded to $destination"

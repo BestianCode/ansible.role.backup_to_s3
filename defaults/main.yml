@@ -1,0 +1,68 @@
+---
+# Toggle entire backup workflow
+aws_s3_backup_enabled: true
+
+# AWS connectivity
+aws_s3_backup_access_key: ""
+aws_s3_backup_secret_key: ""
+aws_s3_backup_bucket: "backups-my-company"
+aws_s3_backup_bucket_folder: "gitlab"
+aws_s3_backup_region: "{{ aws_region | default('eu-central-1') }}"
+
+# Backup content and destination
+aws_s3_backup_folders:
+  - "/git"
+  - "/opt/gitlab"
+  - "/var/opt/gitlab"
+aws_s3_backup_local_folder: "/git-backups/s3"
+aws_s3_backup_local_retention: 7  # number of dated directories to keep locally
+aws_s3_backup_archive_format: "tar.gz"
+
+# Service management
+aws_s3_backup_stop_services: []
+#  - "gitlab-runsvdir.service"
+#  - "gitlab-runner.service"
+#  - "nginx.service"
+aws_s3_backup_start_services: false
+aws_s3_backup_reboot_after: false
+aws_s3_backup_pre_stop_commands: []
+#  - "gitlab-ctl stop"
+#  - "gitlab-ctl stop sidekiq"
+#  - "gitlab-ctl stop postgresql"
+aws_s3_backup_pre_stop_strict: false
+aws_s3_backup_post_start_commands: []
+#  - "gitlab-ctl start"
+
+# Execution details
+aws_s3_backup_user: "root"
+aws_s3_backup_group: "{{ 'wheel' if ansible_system | default('Linux') == 'FreeBSD' else 'root' }}"
+aws_s3_backup_script_path: "/root/sbin/ng-backup.sh"
+aws_s3_backup_restore_script_path: "/root/sbin/ng-restore.sh"
+aws_s3_backup_log_file: "/var/log/ng-backup.log"
+aws_s3_backup_job_name: "FS backup"
+aws_s3_backup_schedule: "0 1 * * *"
+aws_s3_backup_umask: "077"
+aws_s3_backup_exec_path: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/gitlab/bin"
+aws_s3_backup_aws_cli_binary: "/usr/local/bin/aws"
+aws_s3_backup_use_pigz: false
+aws_s3_backup_extra_tar_options: []
+aws_s3_backup_restore_folder: "{{ aws_s3_backup_local_folder }}/restore"
+
+# Safety knobs
+aws_s3_backup_fail_if_missing: false
+aws_s3_backup_manifest_enabled: true
+
+# S3 purge / lifecycle rotation
+aws_s3_backup_purge_enabled: false
+aws_s3_backup_purge_script_path: "/root/sbin/ng-purge.sh"
+aws_s3_backup_purge_log_file: "/var/log/ng-purge.log"
+aws_s3_backup_purge_schedule: "30 3 * * *"
+aws_s3_backup_purge_dry_run: true
+
+# Retention windows (days).  Set any level to 0 to disable it.
+# The windows are contiguous and stack: keep-all → daily → weekly → monthly → delete.
+aws_s3_backup_purge_keep_all_days: 7       # keep every backup made within the last N days
+aws_s3_backup_purge_keep_daily_days: 23     # then keep 1/day for the next N days
+aws_s3_backup_purge_keep_weekly_days: 60    # then keep 1/week for the next N days
+aws_s3_backup_purge_keep_monthly_days: 365  # then keep 1/month for the next N days
+aws_s3_backup_purge_delete_after_days: 0    # delete everything older (0 = disabled — monthly backups are kept forever)

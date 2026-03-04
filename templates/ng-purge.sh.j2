@@ -1,0 +1,386 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PATH="{{ aws_s3_backup_exec_path }}"
+export AWS_PAGER=""
+
+umask {{ aws_s3_backup_umask }}
+
+JOB_NAME="{{ aws_s3_backup_job_name }} purge"
+LOG_FILE="{{ aws_s3_backup_purge_log_file }}"
+mkdir -p "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE"
+chmod 0640 "$LOG_FILE"
+exec >>"$LOG_FILE"
+exec 2>&1
+
+echo "[$(date -Iseconds)] Starting $JOB_NAME"
+
+AWS_CLI_BIN="{{ aws_s3_backup_aws_cli_binary }}"
+if [ ! -x "$AWS_CLI_BIN" ]; then
+  AWS_CLI_BIN="$(command -v aws || true)"
+fi
+if [ -z "$AWS_CLI_BIN" ]; then
+  echo "ERROR: aws cli binary not found" >&2
+  exit 10
+fi
+
+export AWS_ACCESS_KEY_ID="{{ aws_s3_backup_access_key }}"
+export AWS_SECRET_ACCESS_KEY="{{ aws_s3_backup_secret_key }}"
+export AWS_DEFAULT_REGION="{{ aws_s3_backup_region }}"
+export AWS_REGION="{{ aws_s3_backup_region }}"
+unset AWS_SHARED_CREDENTIALS_FILE AWS_PROFILE AWS_CONFIG_FILE
+
+S3_PREFIX="s3://{{ aws_s3_backup_bucket }}/{{ aws_s3_backup_bucket_folder }}/"
+
+# ── OS detection for portable date(1) usage ──
+if [ "$(uname)" = "FreeBSD" ]; then
+  IS_FREEBSD=1
+else
+  IS_FREEBSD=0
+fi
+
+# Portable helper: convert a "YYYY-MM-DD HH:MM" string to epoch
+date_str_to_epoch() {
+  if [ "$IS_FREEBSD" -eq 1 ]; then
+    date -j -f "%Y-%m-%d %H:%M" "$1" +%s 2>/dev/null || echo 0
+  else
+    date -d "$1" +%s 2>/dev/null || echo 0
+  fi
+}
+
+# Portable helper: convert an ISO-8601 timestamp (2026-02-08T01:01:02.000Z) to epoch
+iso_to_epoch() {
+  local ts="${1%%.*}"  # strip fractional seconds (.000Z)
+  ts="${ts%%Z}"        # strip trailing Z if no fractional part
+  if [ "$IS_FREEBSD" -eq 1 ]; then
+    date -j -f "%Y-%m-%dT%H:%M:%S" "$ts" +%s 2>/dev/null || echo 0
+  else
+    date -d "$1" +%s 2>/dev/null || echo 0
+  fi
+}
+
+# Portable helper: format an epoch to a given strftime format
+epoch_fmt() {
+  local ep="$1" fmt="$2"
+  if [ "$IS_FREEBSD" -eq 1 ]; then
+    date -j -r "$ep" +"$fmt"
+  else
+    date -d "@$ep" +"$fmt"
+  fi
+}
+
+# ── Retention windows (days) — 0 means the level is disabled ──
+KEEP_ALL_DAYS={{ aws_s3_backup_purge_keep_all_days | int }}
+KEEP_DAILY_DAYS={{ aws_s3_backup_purge_keep_daily_days | int }}
+KEEP_WEEKLY_DAYS={{ aws_s3_backup_purge_keep_weekly_days | int }}
+KEEP_MONTHLY_DAYS={{ aws_s3_backup_purge_keep_monthly_days | int }}
+DELETE_AFTER_DAYS={{ aws_s3_backup_purge_delete_after_days | int }}
+
+DRY_RUN={{ aws_s3_backup_purge_dry_run | ternary('1', '0') }}
+
+# ── Compute boundary dates (epoch seconds) ──
+NOW_EPOCH=$(date +%s)
+SECS_PER_DAY=86400
+
+boundary_keep_all=0
+boundary_daily=0
+boundary_weekly=0
+boundary_monthly=0
+boundary_delete=0
+
+# Boundaries are expressed as epoch timestamps going into the past.
+# "keep all" zone: [boundary_keep_all .. now]
+# "daily"    zone: [boundary_daily    .. boundary_keep_all)
+# "weekly"   zone: [boundary_weekly   .. boundary_daily)
+# "monthly"  zone: [boundary_monthly  .. boundary_weekly)
+# "delete"   zone: anything older than boundary_delete
+#
+# Each boundary stacks on top of the previous one so the windows are
+# contiguous.  A level set to 0 collapses that window to zero width
+# (effectively disabled — everything falls through to the next level).
+
+cumulative=0
+
+if [ "$KEEP_ALL_DAYS" -gt 0 ]; then
+  cumulative=$(( cumulative + KEEP_ALL_DAYS ))
+fi
+boundary_keep_all=$(( NOW_EPOCH - cumulative * SECS_PER_DAY ))
+
+if [ "$KEEP_DAILY_DAYS" -gt 0 ]; then
+  cumulative=$(( cumulative + KEEP_DAILY_DAYS ))
+fi
+boundary_daily=$(( NOW_EPOCH - cumulative * SECS_PER_DAY ))
+
+if [ "$KEEP_WEEKLY_DAYS" -gt 0 ]; then
+  cumulative=$(( cumulative + KEEP_WEEKLY_DAYS ))
+fi
+boundary_weekly=$(( NOW_EPOCH - cumulative * SECS_PER_DAY ))
+
+if [ "$KEEP_MONTHLY_DAYS" -gt 0 ]; then
+  cumulative=$(( cumulative + KEEP_MONTHLY_DAYS ))
+fi
+boundary_monthly=$(( NOW_EPOCH - cumulative * SECS_PER_DAY ))
+
+if [ "$DELETE_AFTER_DAYS" -gt 0 ]; then
+  cumulative=$(( cumulative + DELETE_AFTER_DAYS ))
+fi
+boundary_delete=$(( NOW_EPOCH - cumulative * SECS_PER_DAY ))
+
+echo "Retention boundaries (cumulative days from today):"
+echo "  Keep-all  : ${KEEP_ALL_DAYS}d"
+echo "  Daily     : ${KEEP_DAILY_DAYS}d"
+echo "  Weekly    : ${KEEP_WEEKLY_DAYS}d"
+echo "  Monthly   : ${KEEP_MONTHLY_DAYS}d"
+echo "  Delete-all: ${DELETE_AFTER_DAYS}d (0 = disabled, keep monthly forever)"
+[ "$DRY_RUN" -eq 1 ] && echo "  *** DRY-RUN MODE — nothing will be deleted ***"
+
+S3_BUCKET="{{ aws_s3_backup_bucket }}"
+S3_FOLDER="{{ aws_s3_backup_bucket_folder }}"
+
+# ── Detect backup layout and list entries ──
+# Layout A (folder-based): prefix contains dated sub-folders like 2026.02.08-01.00/
+# Layout B (flat-file):    prefix contains files directly, dates come from LastModified
+BACKUP_MODE=""
+
+# Try folder-based first: look for common prefixes (sub-folders)
+mapfile -t FOLDER_NAMES < <(
+  "$AWS_CLI_BIN" s3 ls "$S3_PREFIX" \
+    | grep '^ *PRE ' \
+    | awk '{print $2}' \
+    | sed 's#/$##' \
+    | sed '/^$/d' \
+    | sort
+)
+
+# ── Parse backup timestamp → epoch ──
+# Expected folder name format: YYYY.MM.DD-HH.MM (as produced by ng-backup)
+name_to_epoch() {
+  local name="$1"
+  # Convert "2025.01.15-03.00" → "2025-01-15 03:00"
+  local dt
+  dt=$(echo "$name" | sed 's/\./-/; s/\./-/; s/-/ /3; s/\./:/')
+  date_str_to_epoch "$dt"
+}
+
+# Check if folders have parseable dates
+folder_parseable=0
+{% raw %}
+if [ "${#FOLDER_NAMES[@]}" -gt 0 ]; then
+{% endraw %}
+  for fn in "${FOLDER_NAMES[@]}"; do
+    ep=$(name_to_epoch "$fn")
+    if [ "$ep" -ne 0 ]; then
+      folder_parseable=1
+      break
+    fi
+  done
+fi
+
+declare -a BACKUP_ENTRIES=()   # "name|epoch|type" — type: folder or file
+
+if [ "$folder_parseable" -eq 1 ]; then
+  BACKUP_MODE="folder"
+  echo "Detected folder-based backup layout"
+  for fn in "${FOLDER_NAMES[@]}"; do
+    ep=$(name_to_epoch "$fn")
+    if [ "$ep" -ne 0 ]; then
+      BACKUP_ENTRIES+=("${fn}|${ep}|folder")
+    else
+      BACKUP_ENTRIES+=("${fn}|0|folder")
+    fi
+  done
+else
+  # Fall back to flat-file mode: list objects and use LastModified
+  BACKUP_MODE="file"
+  echo "Detected flat-file backup layout (using LastModified dates)"
+  while IFS=$'\t' read -r key last_modified; do
+    [ -z "$key" ] && continue
+    [ "$key" = "None" ] && continue
+    fname=$(basename "$key")
+    ep=$(iso_to_epoch "$last_modified")
+    BACKUP_ENTRIES+=("${fname}|${ep}|file")
+  done < <(
+    "$AWS_CLI_BIN" s3api list-objects-v2 \
+      --bucket "$S3_BUCKET" \
+      --prefix "${S3_FOLDER}/" \
+      --query 'Contents[].{Key:Key,LM:LastModified}' \
+      --output text \
+      --region "$AWS_DEFAULT_REGION" \
+    | awk '{print $1 "\t" $2}'
+  )
+fi
+
+{% raw %}
+if [ "${#BACKUP_ENTRIES[@]}" -eq 0 ]; then
+{% endraw %}
+  echo "No backups found under $S3_PREFIX — nothing to do."
+  exit 0
+fi
+
+{% raw %}
+echo "Found ${#BACKUP_ENTRIES[@]} backup(s) in S3 (mode: $BACKUP_MODE)"
+{% endraw %}
+
+# ── Classify each backup into a zone ──
+declare -a ZONE_KEEP=()      # keep unconditionally
+declare -a ZONE_DAILY=()
+declare -a ZONE_WEEKLY=()
+declare -a ZONE_MONTHLY=()
+declare -a ZONE_DELETE=()
+declare -a ZONE_UNKNOWN=()
+
+for entry in "${BACKUP_ENTRIES[@]}"; do
+  name="${entry%%|*}"
+  rest="${entry#*|}"
+  ep="${rest%%|*}"
+  btype="${rest##*|}"
+
+  if [ "$ep" -eq 0 ]; then
+    ZONE_UNKNOWN+=("$name|$btype")
+    continue
+  fi
+
+  if [ "$ep" -ge "$boundary_keep_all" ]; then
+    ZONE_KEEP+=("$name|$ep|$btype")
+  elif [ "$ep" -ge "$boundary_daily" ]; then
+    ZONE_DAILY+=("$name|$ep|$btype")
+  elif [ "$ep" -ge "$boundary_weekly" ]; then
+    ZONE_WEEKLY+=("$name|$ep|$btype")
+  elif [ "$ep" -ge "$boundary_monthly" ]; then
+    ZONE_MONTHLY+=("$name|$ep|$btype")
+  else
+    # Older than all retention windows
+    if [ "$DELETE_AFTER_DAYS" -gt 0 ]; then
+      ZONE_DELETE+=("$name|$ep|$btype")
+    else
+      # DELETE_AFTER disabled → fall back to monthly retention
+      ZONE_MONTHLY+=("$name|$ep|$btype")
+    fi
+  fi
+done
+
+{% raw %}
+echo "Zone counts: keep-all=${#ZONE_KEEP[@]} daily=${#ZONE_DAILY[@]} weekly=${#ZONE_WEEKLY[@]} monthly=${#ZONE_MONTHLY[@]} delete=${#ZONE_DELETE[@]} unknown=${#ZONE_UNKNOWN[@]}"
+{% endraw %}
+
+# ── Helper: given a list of "name|epoch|type" entries grouped by a key,
+#    keep only the latest entry per group, mark the rest for deletion ──
+declare -a TO_DELETE=()    # "name|type"
+
+thin_by_group() {
+  local -n entries=$1
+  local group_func=$2      # "daily" | "weekly" | "monthly"
+
+{% raw %}
+  if [ "${#entries[@]}" -eq 0 ]; then
+{% endraw %}
+    return
+  fi
+
+  # Build associative array: group_key → best_name|best_epoch|best_type
+  declare -A best=()
+  declare -A best_epoch_map=()
+  declare -A best_type_map=()
+
+  for entry in "${entries[@]}"; do
+    local name="${entry%%|*}"
+    local rest="${entry#*|}"
+    local ep="${rest%%|*}"
+    local btype="${rest##*|}"
+
+    local group_key
+    case "$group_func" in
+      daily)
+        # group by calendar date YYYY-MM-DD
+        group_key=$(epoch_fmt "$ep" "%Y-%m-%d")
+        ;;
+      weekly)
+        # group by ISO year-week YYYY-WNN
+        group_key=$(epoch_fmt "$ep" "%G-W%V")
+        ;;
+      monthly)
+        # group by year-month YYYY-MM
+        group_key=$(epoch_fmt "$ep" "%Y-%m")
+        ;;
+    esac
+
+    if [ -z "${best[$group_key]+x}" ]; then
+      best[$group_key]="$name"
+      best_epoch_map[$group_key]="$ep"
+      best_type_map[$group_key]="$btype"
+    else
+      local existing_ep="${best_epoch_map[$group_key]}"
+      if [ "$ep" -gt "$existing_ep" ]; then
+        # Current entry is newer — old best goes to delete list
+        TO_DELETE+=("${best[$group_key]}|${best_type_map[$group_key]}")
+        best[$group_key]="$name"
+        best_epoch_map[$group_key]="$ep"
+        best_type_map[$group_key]="$btype"
+      else
+        TO_DELETE+=("$name|$btype")
+      fi
+    fi
+  done
+
+{% raw %}
+  echo "  $group_func retention: keeping ${#best[@]} backup(s), removing $(( ${#entries[@]} - ${#best[@]} )) excess"
+{% endraw %}
+}
+
+# ── Apply thinning per zone ──
+thin_by_group ZONE_DAILY   daily
+thin_by_group ZONE_WEEKLY  weekly
+thin_by_group ZONE_MONTHLY monthly
+
+# Everything in ZONE_DELETE is removed outright
+for entry in "${ZONE_DELETE[@]}"; do
+  name="${entry%%|*}"
+  rest="${entry#*|}"
+  btype="${rest##*|}"
+  TO_DELETE+=("$name|$btype")
+done
+
+# Unknown names are left untouched (logged)
+{% raw %}
+if [ "${#ZONE_UNKNOWN[@]}" -gt 0 ]; then
+{% endraw %}
+  echo "Skipping unrecognised entries:"
+  for entry in "${ZONE_UNKNOWN[@]}"; do
+    echo "  ${entry%%|*}"
+  done
+fi
+
+# ── Perform deletions ──
+{% raw %}
+if [ "${#TO_DELETE[@]}" -eq 0 ]; then
+{% endraw %}
+  echo "Nothing to purge."
+else
+{% raw %}
+  echo "Purging ${#TO_DELETE[@]} backup(s):"
+{% endraw %}
+  for entry in "${TO_DELETE[@]}"; do
+    name="${entry%%|*}"
+    btype="${entry##*|}"
+    if [ "$btype" = "folder" ]; then
+      target="${S3_PREFIX}${name}/"
+      if [ "$DRY_RUN" -eq 1 ]; then
+        echo "  [dry-run] would delete folder $target"
+      else
+        echo "  Deleting folder $target"
+        "$AWS_CLI_BIN" s3 rm "$target" --recursive --only-show-errors --region "$AWS_DEFAULT_REGION"
+      fi
+    else
+      target="${S3_PREFIX}${name}"
+      if [ "$DRY_RUN" -eq 1 ]; then
+        echo "  [dry-run] would delete file $target"
+      else
+        echo "  Deleting file $target"
+        "$AWS_CLI_BIN" s3 rm "$target" --only-show-errors --region "$AWS_DEFAULT_REGION"
+      fi
+    fi
+  done
+fi
+
+echo "[$(date -Iseconds)] $JOB_NAME finished"

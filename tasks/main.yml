@@ -1,0 +1,19 @@
+---
+- name: "Disable S3 backup automation when turned off"
+  ansible.builtin.cron:
+    name: "{{ aws_s3_backup_job_name }}"
+    user: "{{ aws_s3_backup_user }}"
+    state: absent
+  when: not aws_s3_backup_enabled | bool
+
+- name: "Disable S3 purge automation when turned off"
+  ansible.builtin.cron:
+    name: "{{ aws_s3_backup_job_name }} purge"
+    user: "{{ aws_s3_backup_user }}"
+    state: absent
+    cron_file: "ng-purge"
+  when: not aws_s3_backup_purge_enabled | bool
+
+- name: "Configure S3 backups"
+  ansible.builtin.include_tasks: setup.yml
+  when: aws_s3_backup_enabled | bool or aws_s3_backup_purge_enabled | bool

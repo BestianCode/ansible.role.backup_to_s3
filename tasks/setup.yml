@@ -1,0 +1,104 @@
+---
+- name: "Validate mandatory backup inputs"
+  ansible.builtin.assert:
+    that:
+      - aws_s3_backup_access_key | length > 0
+      - aws_s3_backup_secret_key | length > 0
+      - aws_s3_backup_bucket | length > 0
+      - aws_s3_backup_bucket_folder | length > 0
+      - aws_s3_backup_region | length > 0
+    quiet: true
+
+- name: "Ensure local backup directory exists"
+  ansible.builtin.file:
+    path: "{{ aws_s3_backup_local_folder }}"
+    state: directory
+    owner: "{{ aws_s3_backup_user }}"
+    group: "{{ aws_s3_backup_group }}"
+    mode: "0700"
+  when: aws_s3_backup_enabled | bool
+
+- name: "Ensure backup script directory exists"
+  ansible.builtin.file:
+    path: "{{ aws_s3_backup_script_path | dirname }}"
+    state: directory
+    owner: "{{ aws_s3_backup_user }}"
+    group: "{{ aws_s3_backup_group }}"
+    mode: "0755"
+  when: aws_s3_backup_enabled | bool
+
+- name: "Ensure restore script directory exists"
+  ansible.builtin.file:
+    path: "{{ aws_s3_backup_restore_script_path | dirname }}"
+    state: directory
+    owner: "{{ aws_s3_backup_user }}"
+    group: "{{ aws_s3_backup_group }}"
+    mode: "0755"
+  when: aws_s3_backup_enabled | bool
+
+- name: "Deploy backup script"
+  ansible.builtin.template:
+    src: ng-backup.sh.j2
+    dest: "{{ aws_s3_backup_script_path }}"
+    owner: "{{ aws_s3_backup_user }}"
+    group: "{{ aws_s3_backup_group }}"
+    mode: "0750"
+  when: aws_s3_backup_enabled | bool
+#  no_log: true
+
+- name: "Deploy restore script"
+  ansible.builtin.template:
+    src: ng-restore.sh.j2
+    dest: "{{ aws_s3_backup_restore_script_path }}"
+    owner: "{{ aws_s3_backup_user }}"
+    group: "{{ aws_s3_backup_group }}"
+    mode: "0750"
+  when: aws_s3_backup_enabled | bool
+
+- name: "Register cron job for S3 backup"
+  ansible.builtin.cron:
+    name: "{{ aws_s3_backup_job_name }}"
+    user: "{{ aws_s3_backup_user }}"
+    job: "{{ aws_s3_backup_script_path }}"
+    state: present
+    minute: "{{ aws_s3_backup_schedule.split()[0] }}"
+    hour: "{{ aws_s3_backup_schedule.split()[1] }}"
+    day: "{{ aws_s3_backup_schedule.split()[2] }}"
+    month: "{{ aws_s3_backup_schedule.split()[3] }}"
+    weekday: "{{ aws_s3_backup_schedule.split()[4] }}"
+    cron_file: "ng-backup"
+  when: aws_s3_backup_enabled | bool
+
+# ── Purge (S3 retention lifecycle) ──────────────────────────────
+
+- name: "Ensure purge script directory exists"
+  ansible.builtin.file:
+    path: "{{ aws_s3_backup_purge_script_path | dirname }}"
+    state: directory
+    owner: "{{ aws_s3_backup_user }}"
+    group: "{{ aws_s3_backup_group }}"
+    mode: "0755"
+  when: aws_s3_backup_purge_enabled | bool
+
+- name: "Deploy purge script"
+  ansible.builtin.template:
+    src: ng-purge.sh.j2
+    dest: "{{ aws_s3_backup_purge_script_path }}"
+    owner: "{{ aws_s3_backup_user }}"
+    group: "{{ aws_s3_backup_group }}"
+    mode: "0750"
+  when: aws_s3_backup_purge_enabled | bool
+
+- name: "Register cron job for S3 purge"
+  ansible.builtin.cron:
+    name: "{{ aws_s3_backup_job_name }} purge"
+    user: "{{ aws_s3_backup_user }}"
+    job: "{{ aws_s3_backup_purge_script_path }}"
+    state: present
+    minute: "{{ aws_s3_backup_purge_schedule.split()[0] }}"
+    hour: "{{ aws_s3_backup_purge_schedule.split()[1] }}"
+    day: "{{ aws_s3_backup_purge_schedule.split()[2] }}"
+    month: "{{ aws_s3_backup_purge_schedule.split()[3] }}"
+    weekday: "{{ aws_s3_backup_purge_schedule.split()[4] }}"
+    cron_file: "ng-purge"
+  when: aws_s3_backup_purge_enabled | bool
