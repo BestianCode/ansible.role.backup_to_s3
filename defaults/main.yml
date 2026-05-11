@@ -47,6 +47,9 @@ aws_s3_backup_aws_cli_binary: "/usr/local/bin/aws"
 aws_s3_backup_use_pigz: false
 aws_s3_backup_extra_tar_options: []
 aws_s3_backup_restore_folder: "{{ aws_s3_backup_local_folder }}/restore"
+aws_s3_backup_encryption_enabled: false
+aws_s3_backup_encryption_cipher: "aes-256-cbc"
+aws_s3_backup_encryption_passphrase: ""
 
 # Safety knobs
 aws_s3_backup_fail_if_missing: false

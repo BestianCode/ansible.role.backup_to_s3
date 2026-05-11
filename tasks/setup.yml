@@ -7,7 +7,28 @@
       - aws_s3_backup_bucket | length > 0
       - aws_s3_backup_bucket_folder | length > 0
       - aws_s3_backup_region | length > 0
+      - (not aws_s3_backup_encryption_enabled | bool) or (aws_s3_backup_encryption_passphrase | length > 0)
+      - (aws_s3_backup_archive_format != '7z') or (aws_s3_backup_encryption_passphrase | length > 0)
     quiet: true
+
+- name: "Ensure 7z is installed on Debian/Ubuntu for 7z backups"
+  when:
+    - aws_s3_backup_enabled | bool
+    - aws_s3_backup_archive_format == '7z'
+    - ansible_os_family == 'Debian'
+  block:
+    - name: "Install 7zip package"
+      ansible.builtin.apt:
+        name: "7zip"
+        state: present
+        update_cache: true
+
+  rescue:
+    - name: "Install p7zip-full fallback package"
+      ansible.builtin.apt:
+        name: "p7zip-full"
+        state: present
+        update_cache: true
 
 - name: "Ensure local backup directory exists"
   ansible.builtin.file:

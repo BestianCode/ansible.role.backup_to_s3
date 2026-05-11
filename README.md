@@ -27,6 +27,20 @@ Because all three scripts embed AWS credentials directly, restrict filesystem pe
 | `aws_s3_backup_restore_folder` | `/git-backups/s3/restore` | Target directory for downloaded backups. |
 | `aws_s3_backup_exec_path` | `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/gitlab/bin` | PATH injected into both scripts so cron can find `gitlab-ctl`, `aws`, etc. |
 | `aws_s3_backup_schedule` | `0 1 * * *` | Cron expression used to run `ng-backup.sh`. |
+| `aws_s3_backup_archive_format` | `tar.gz` | Archive format (`tar.gz` or `7z`). |
+| `aws_s3_backup_encryption_enabled` | `false` | Encrypt each produced artifact before upload. |
+| `aws_s3_backup_encryption_cipher` | `aes-256-cbc` | OpenSSL cipher used with `openssl enc` when encryption is enabled. |
+| `aws_s3_backup_encryption_passphrase` | `""` | Passphrase for encryption (store in Ansible Vault). |
+
+To use password-protected 7z archives instead of gzip, set:
+
+```yaml
+aws_s3_backup_archive_format: "7z"
+aws_s3_backup_encryption_passphrase: "vault-or-secret-value"
+aws_s3_backup_encryption_enabled: false
+```
+
+In this mode the script uses `7z a -t7z -mhe=on -p...` to produce encrypted `.7z` artifacts directly.
 
 ### S3 purge variables
 
@@ -45,7 +59,7 @@ Because all three scripts embed AWS credentials directly, restrict filesystem pe
 
 All five windows are contiguous and stack on top of each other:
 
-```
+```text
 today ──────────────────────────────────────────────────────────────► past
 │  keep all  │  1 per day  │  1 per week  │  1 per month  │  delete  │
 │   7 days   │   23 days   │   60 days    │   365 days    │  (rest)  │
@@ -62,6 +76,15 @@ See `defaults/main.yml` for the full catalog, including AWS credentials, logging
 3. Extract whichever tarball you need from the downloaded directory.
 
 The script simply wraps `aws s3 sync`, so you can clean up restored directories at any time without affecting the data stored in S3.
+
+If encryption is enabled, downloaded artifacts have `.enc` suffix and must be decrypted before extraction. Example:
+
+```bash
+openssl enc -d -aes-256-cbc -pbkdf2 \
+  -pass env:BACKUP_ENCRYPTION_PASSPHRASE \
+  -in archive.tar.gz.enc \
+  -out archive.tar.gz
+```
 
 ## Using the purge script
 

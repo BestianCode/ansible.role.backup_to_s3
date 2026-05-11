@@ -48,6 +48,9 @@ FAIL_IF_MISSING={{ aws_s3_backup_fail_if_missing | ternary('1', '0') }}
 MANIFEST_ENABLED={{ aws_s3_backup_manifest_enabled | ternary('1', '0') }}
 USE_PIGZ={{ aws_s3_backup_use_pigz | ternary('1', '0') }}
 ARCHIVE_EXT="{{ aws_s3_backup_archive_format }}"
+ENCRYPTION_ENABLED={{ aws_s3_backup_encryption_enabled | ternary('1', '0') }}
+ENCRYPTION_CIPHER="{{ aws_s3_backup_encryption_cipher }}"
+export BACKUP_ENCRYPTION_PASSPHRASE="{{ aws_s3_backup_encryption_passphrase }}"
 
 BACKUP_PATHS=(
 {% for path in aws_s3_backup_folders %}
@@ -157,6 +160,46 @@ stop_services() {
 run_pre_stop_commands
 stop_services
 
+if [ "$ARCHIVE_EXT" = "7z" ]; then
+  if ! command -v 7z >/dev/null 2>&1; then
+    echo "ERROR: 7z binary not found but archive format is 7z" >&2
+    exit 33
+  fi
+  if [ -z "${BACKUP_ENCRYPTION_PASSPHRASE:-}" ]; then
+    echo "ERROR: backup encryption passphrase is empty but archive format is 7z" >&2
+    exit 34
+  fi
+fi
+
+if [ "$ENCRYPTION_ENABLED" -eq 1 ]; then
+  if ! command -v openssl >/dev/null 2>&1; then
+    echo "ERROR: openssl binary not found but encryption is enabled" >&2
+    exit 31
+  fi
+fi
+
+encrypt_artifact() {
+  local plain_path="$1"
+  if [ "$ENCRYPTION_ENABLED" -ne 1 ]; then
+    printf '%s\n' "$plain_path"
+    return
+  fi
+
+  if [ -z "${BACKUP_ENCRYPTION_PASSPHRASE:-}" ]; then
+    echo "ERROR: backup encryption passphrase is empty" >&2
+    exit 32
+  fi
+
+  local encrypted_path="${plain_path}.enc"
+  echo "Encrypting $plain_path to $encrypted_path"
+  openssl enc "-$ENCRYPTION_CIPHER" -salt -pbkdf2 \
+    -pass env:BACKUP_ENCRYPTION_PASSPHRASE \
+    -in "$plain_path" \
+    -out "$encrypted_path"
+  rm -f "$plain_path"
+  printf '%s\n' "$encrypted_path"
+}
+
 TAR_BASE_CMD=(tar)
 TAR_MODE="-czf"
 if [ "$USE_PIGZ" -eq 1 ] && command -v pigz >/dev/null 2>&1; then
@@ -204,28 +247,44 @@ for pattern in "${BACKUP_PATHS[@]}"; do
     safe_name=$(echo "$src" | sed 's#/#_#g' | sed 's/^_//')
     safe_target="$FILES_DIR/${safe_name}"
 
-    if [ -f "$src" ]; then
+    if [ "$ARCHIVE_EXT" != "7z" ] && [ -f "$src" ]; then
       ext="${src##*.}"
       ext_lower=$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')
       case "$ext_lower" in
         gz|bz|bz2|zip|7z)
           echo "Copying pre-compressed file $src to $safe_target"
           cp -a "$src" "$safe_target"
+          final_artifact="$(encrypt_artifact "$safe_target")"
           MANIFEST_SOURCES+=("$src")
-          MANIFEST_ARCHIVES+=("$(basename "$safe_target")")
+          MANIFEST_ARCHIVES+=("$(basename "$final_artifact")")
           continue
           ;;
       esac
     fi
 
     archive_path="${safe_target}.${ARCHIVE_EXT}"
+
+    if [ "$ARCHIVE_EXT" = "7z" ]; then
+      echo "Archiving $src to $archive_path with 7z password protection"
+      src_dir=$(dirname "$src")
+      src_item=$(basename "$src")
+      (
+        cd "$src_dir"
+        7z a -t7z -mhe=on -p"$BACKUP_ENCRYPTION_PASSPHRASE" -- "$archive_path" "$src_item"
+      )
+      MANIFEST_SOURCES+=("$src")
+      MANIFEST_ARCHIVES+=("$(basename "$archive_path")")
+      continue
+    fi
+
     echo "Archiving $src to $archive_path"
     src_dir=$(dirname "$src")
     src_item=$(basename "$src")
     tar_cmd=("${TAR_BASE_CMD[@]}" "$TAR_MODE" "$archive_path" -C "$src_dir" "$src_item")
     "${tar_cmd[@]}"
+    final_artifact="$(encrypt_artifact "$archive_path")"
     MANIFEST_SOURCES+=("$src")
-    MANIFEST_ARCHIVES+=("$(basename "$archive_path")")
+    MANIFEST_ARCHIVES+=("$(basename "$final_artifact")")
   done
 done
 {% endraw %}
